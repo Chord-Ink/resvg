@@ -6,6 +6,7 @@ use std::num::NonZeroU16;
 use std::sync::Arc;
 
 use fontdb::{Database, ID};
+#[cfg(target_family = "wasm")]
 use harfrust::ShapeOptions;
 use kurbo::{ParamCurve, ParamCurveArclen, ParamCurveDeriv};
 use skrifa::MetadataProvider;
@@ -1424,6 +1425,7 @@ pub(crate) fn shape_text(
 /// Converts a text into a list of glyph IDs.
 ///
 /// This function will do the BIDI reordering and text shaping.
+#[cfg(target_family = "wasm")]
 fn shape_text_with_font(
     text: &str,
     font: Arc<ResolvedFont>,
@@ -1532,6 +1534,134 @@ fn shape_text_with_font(
                     cluster_len: end.checked_sub(start).unwrap_or(0), // TODO: can fail?
                     text: sub_text[start..end].to_string(),
                     id: GlyphId(info.glyph_id),
+                    dx: pos.x_offset,
+                    dy: pos.y_offset,
+                    width: pos.x_advance,
+                    font: font.clone(),
+                });
+            }
+        }
+
+        Some(glyphs)
+    })?
+}
+
+/// Converts a text into a list of glyph IDs.
+///
+/// This function will do the BIDI reordering and text shaping with HarfBuzz.
+#[cfg(not(target_family = "wasm"))]
+fn shape_text_with_font(
+    text: &str,
+    font: Arc<ResolvedFont>,
+    small_caps: bool,
+    apply_kerning: bool,
+    variations: &[crate::FontVariation],
+    font_size: f32,
+    font_optical_sizing: crate::FontOpticalSizing,
+    fontdb: &fontdb::Database,
+) -> Option<Vec<Glyph>> {
+    fontdb.with_face_data(font.id, |font_data, face_index| -> Option<Vec<Glyph>> {
+        use gpui_hb::{Blob, Buffer, Direction, Face, Feature, Variation, tag};
+
+        // SAFETY: `font_data` outlives the blob, face and font below, which are all dropped
+        // before this closure returns.
+        #[allow(unsafe_code)]
+        let blob = unsafe { Blob::from_borrowed(font_data) }?;
+        let face = Face::new(&blob, face_index)?;
+        let mut hb_font = gpui_hb::Font::new(&face);
+        let upem = i32::try_from(face.upem()).ok()?;
+        hb_font.set_scale(upem, upem);
+
+        let mut variations: Vec<Variation> = variations
+            .iter()
+            .map(|v| Variation::new(tag(&v.tag), v.value))
+            .collect();
+
+        // Automatic optical sizing: if font-optical-sizing is auto and the font has
+        // an 'opsz' axis that isn't explicitly set, auto-set it to match font size.
+        // This matches browser behavior (CSS font-optical-sizing: auto).
+        if font_optical_sizing == crate::FontOpticalSizing::Auto {
+            let opsz = tag(b"opsz");
+            let has_explicit_opsz = variations.iter().any(|v| v.tag == opsz);
+            if !has_explicit_opsz && face.axis(opsz).is_some() {
+                variations.push(Variation::new(opsz, font_size));
+            }
+        }
+
+        if !variations.is_empty() {
+            hb_font.set_variations(&variations);
+        }
+
+        let bidi_info = unicode_bidi::BidiInfo::new(text, Some(unicode_bidi::Level::ltr()));
+        let paragraph = &bidi_info.paragraphs[0];
+        let line = paragraph.range.clone();
+
+        let mut glyphs = Vec::new();
+
+        let mut features = Vec::new();
+        if small_caps {
+            features.push(Feature::new(tag(b"smcp"), 1));
+        }
+        if !apply_kerning {
+            features.push(Feature::new(tag(b"kern"), 0));
+        }
+
+        let mut buffer = Buffer::new();
+        let (levels, runs) = bidi_info.visual_runs(paragraph, line);
+        for run in runs.iter() {
+            let sub_text = &text[run.clone()];
+            if sub_text.is_empty() {
+                continue;
+            }
+
+            let ltr = levels[run.start].is_ltr();
+            let direction = if ltr { Direction::Ltr } else { Direction::Rtl };
+
+            // The script of the first character that has one, and no language.
+            let script = sub_text
+                .chars()
+                .map(|c| c.script())
+                .find(|s| {
+                    !matches!(
+                        s,
+                        unicode_script::Script::Common
+                            | unicode_script::Script::Inherited
+                            | unicode_script::Script::Unknown
+                    )
+                })
+                .unwrap_or(unicode_script::Script::Unknown);
+
+            buffer.add_str(sub_text, 0..sub_text.len());
+            buffer.shape(
+                &hb_font,
+                direction,
+                gpui_hb::Script::new(script.short_name()),
+                None,
+                &features,
+            );
+
+            let (infos, positions) = buffer.glyphs();
+
+            for i in 0..infos.len() {
+                let pos = positions[i];
+                let info = infos[i];
+                let idx = run.start + info.cluster as usize;
+
+                let start = info.cluster as usize;
+
+                let end = if ltr {
+                    i.checked_add(1)
+                } else {
+                    i.checked_sub(1)
+                }
+                .and_then(|last| infos.get(last))
+                .map_or(sub_text.len(), |info| info.cluster as usize);
+
+                glyphs.push(Glyph {
+                    byte_idx: ByteIndex::new(idx),
+                    cluster_len: end.checked_sub(start).unwrap_or(0), // TODO: can fail?
+                    text: sub_text[start..end].to_string(),
+                    id: GlyphId(info.codepoint),
                     dx: pos.x_offset,
                     dy: pos.y_offset,
                     width: pos.x_advance,

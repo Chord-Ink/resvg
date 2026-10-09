@@ -46,7 +46,8 @@ and can focus just on the rendering part.
 [SVG]: https://en.wikipedia.org/wiki/Scalable_Vector_Graphics
 */
 
-#![forbid(unsafe_code)]
+#![cfg_attr(target_family = "wasm", forbid(unsafe_code))]
+#![cfg_attr(not(target_family = "wasm"), deny(unsafe_code))]
 #![warn(missing_docs)]
 #![warn(missing_debug_implementations)]
 #![warn(missing_copy_implementations)]
